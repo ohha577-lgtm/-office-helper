@@ -439,14 +439,91 @@
     return { rows, lists };
   }
 
+  /* 엑셀 서식 읽기 — 한컴 셀 파일처럼 서식을 <AlternateContent>로 감싼 경우도 바르게 */
+  async function xlsxStyles(zip) {
+    const xfFmt = [], customFmt = {};
+    if (zip.file('xl/styles.xml')) {
+      const st = parseXml(await zip.file('xl/styles.xml').async('string'));
+      els(st, 'numFmt').forEach(n => { customFmt[n.getAttribute('numFmtId')] = n.getAttribute('formatCode') || ''; });
+      const cx = els(st, 'cellXfs')[0];
+      if (cx) for (let n = cx.firstChild; n; n = n.nextSibling) {
+        if (n.nodeType !== 1) continue;
+        if (n.localName === 'xf') xfFmt.push(n.getAttribute('numFmtId'));
+        else if (n.localName === 'AlternateContent') {
+          const fb = kids(n, 'Fallback')[0] || kids(n, 'Choice')[0];
+          const x = fb && kids(fb, 'xf')[0];
+          xfFmt.push(x ? x.getAttribute('numFmtId') : '0');
+        }
+      }
+    }
+    const isDateStyle = c => {
+      const id = +(xfFmt[+(c.getAttribute('s') || 0)] || 0);
+      if ((id >= 14 && id <= 22) || (id >= 27 && id <= 36) || (id >= 45 && id <= 47) || (id >= 50 && id <= 58)) return true;
+      const code = (customFmt[id] || '').replace(/"[^"]*"|\[[^\]]*\]/g, '');
+      return /[yd]/i.test(code) || /m{1,2}\W{0,3}d|aaa/i.test(code);
+    };
+    return { isDateStyle };
+  }
+  function serialToDate(n) {
+    const d = new Date(Date.UTC(1899, 11, 30) + Math.floor(+n) * 86400000);
+    const p2 = x => (x < 10 ? '0' : '') + x;
+    return d.getUTCFullYear() + '-' + p2(d.getUTCMonth() + 1) + '-' + p2(d.getUTCDate());
+  }
+  /* 엑셀 자료 → 시트마다 줄·칸 글자 (날짜는 2024-12-31 모양, 숫자는 그대로) */
+  async function xlsxRows(buf) {
+    const zip = await root.JSZip.loadAsync(buf);
+    let ssItems = [];
+    if (zip.file('xl/sharedStrings.xml'))
+      ssItems = kids(parseXml(await zip.file('xl/sharedStrings.xml').async('string')).documentElement, 'si');
+    const { isDateStyle } = await xlsxStyles(zip);
+    const sheets = [];
+    const paths = Object.keys(zip.files).filter(n => /^xl\/worksheets\/sheet\d+\.xml$/.test(n)).sort(numSort);
+    for (const path of paths) {
+      const doc = parseXml(await zip.file(path).async('string'));
+      const grid = [], dateCol = {};
+      els(doc, 'c').forEach(c => {
+        const p = parseRef(c.getAttribute('r'));
+        if (!p) return;
+        const t = c.getAttribute('t');
+        let s;
+        if (t === 's') { const v = kids(c, 'v')[0]; s = v ? textOf(ssItems[+v.textContent]) : ''; }
+        else if (t === 'inlineStr') s = textOf(kids(c, 'is')[0]);
+        else { const v = kids(c, 'v')[0]; s = v ? v.textContent : ''; }
+        s = String(s).trim();
+        const num = !t && /^\d+(\.\d+)?$/.test(s);
+        if (num && isDateStyle(c)) dateCol[p.col] = true;
+        (grid[p.row - 1] = grid[p.row - 1] || [])[p.col - 1] = { s, num, date: num && isDateStyle(c) };
+      });
+      // 같은 열에 날짜 칸이 있으면, 그 열의 날짜 범위 숫자도 날짜로 봄
+      const rows = [];
+      for (let r = 0; r < grid.length; r++) {
+        const row = grid[r] || [];
+        const out = [];
+        for (let c = 0; c < row.length; c++) {
+          const x = row[c];
+          if (!x) { out.push(''); continue; }
+          const asDate = x.date || (x.num && dateCol[c + 1] && +x.s >= 20000 && +x.s < 80000 && Number.isInteger(+x.s));
+          out.push(asDate ? serialToDate(x.s) : x.s);
+        }
+        rows.push(out);
+      }
+      sheets.push(rows);
+    }
+    return sheets;
+  }
+
   async function readDataFile(name, buf) {
     const ext = extOf(name);
     if (['xlsx', 'xlsm', 'xls', 'csv', 'ods'].includes(ext)) {
-      const wb = root.XLSX.read(buf, { type: 'array' });
+      let sheetRows;
+      if (ext === 'xlsx' || ext === 'xlsm') sheetRows = await xlsxRows(buf);
+      else {
+        const wb = root.XLSX.read(buf, { type: 'array' });
+        sheetRows = wb.SheetNames.map(sn => root.XLSX.utils.sheet_to_json(wb.Sheets[sn], { header: 1, raw: false, defval: '' }));
+      }
       const rows = [], headers = new Set();
-      wb.SheetNames.forEach(sn => {
-        const a = root.XLSX.utils.sheet_to_json(wb.Sheets[sn], { header: 1, raw: false, defval: '' })
-          .map(r => r.map(v => String(v == null ? '' : v).trim()))
+      sheetRows.forEach(sr => {
+        const a = sr.map(r => Array.from(r || [], v => String(v == null ? '' : v).trim()))
           .filter(r => r.some(Boolean));
         // 첫 줄이 '성명 | 학년 | 반 …' 같은 제목 줄인지 살펴보기 (명단형 표)
         if (a.length >= 2) {
@@ -543,10 +620,19 @@
         // 여러 줄을 합친 칸(예: 부서)은 사람 찾기에 쓰지 않음
         cells.forEach((v, i) => { if (v && !skip[i] && !tall[i] && !ID_SKIP.test(hs[i])) ids.push([hs[i], valKey(v)]); });
         let rec = null, from = '';
+        const hits = [];                                       // 자료 파일마다 같은 줄(사람·날짜)
         if (ids.length) {
           for (const l of cands) {
-            rec = l.records.find(r => !used.has(r) && ids.every(([h, v]) => r[h] != null && valKey(r[h]) === v));
-            if (rec) { from = l.name; break; }
+            const r = l.records.find(r => !used.has(r) && ids.every(([h, v]) => r[h] != null && valKey(r[h]) === v));
+            if (r) hits.push({ r, name: l.name });
+          }
+          if (hits.length) {
+            hits.forEach(h => used.add(h.r));
+            // 앞 파일에서 비어 있는 칸은 뒤 파일의 값으로 채움
+            const pick = h => hits.map(x => x.r[h]).find(v => v != null && String(v).trim() !== '');
+            const names = Array.from(new Set(hits.filter(x => hs.some((h, i) => !cells[i] && x.r[h] != null && String(x.r[h]).trim())).map(x => x.name)));
+            return { from: names.join(', ') || hits[0].name,
+                     values: cells.map((v, i) => (v || skip[i]) ? null : String(pick(hs[i]) || '')) };
           }
           if (!rec) {                                          // 다 맞지 않으면 가장 많이 맞는 줄
             let top = 0;
