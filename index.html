@@ -63,6 +63,11 @@
   td input { width: 100%; padding: 10px; font-size: 17px; border: 2px solid #d1d5db; border-radius: 8px; }
   td input.found { border-color: #22c55e; background: #f0fdf4; }
   td input.empty { border-color: #f59e0b; background: #fffbeb; }
+  .listWrap { overflow-x: auto; margin-bottom: 20px; }
+  .listCap { font-weight: bold; margin: 4px 0 8px; }
+  table.listTable th, table.listTable td { border: 1px solid #e5e7eb; padding: 4px; font-size: 15px; white-space: nowrap; }
+  table.listTable td.fixed { background: #f1f5f9; padding: 6px 10px; }
+  table.listTable input { min-width: 110px; padding: 6px; font-size: 15px; }
   #msg { min-height: 28px; font-weight: bold; }
   .ok { color: #047857; } .err { color: #b91c1c; } .info { color: #1d4ed8; }
   .hidden { display: none !important; }
@@ -160,6 +165,19 @@
       t.setAttributeNS('http://www.w3.org/XML/1998/namespace', 'xml:space', 'preserve');
   }
 
+
+  /* 명단형 표: 첫 줄이 제목(연번|성명|성별…), 아래 줄들이 사람마다 한 줄 */
+  function tableGrid(tbl) {
+    return kids(tbl, 'tr').map(tr => kids(tr, 'tc'));
+  }
+  function isListTable(grid, texts) {
+    if (grid.length < 3) return false;                       // 제목 + 2줄 이상
+    const n = grid[0].length;
+    if (n < 2 || !texts[0].every(isLabel)) return false;
+    return grid.slice(1).every(r => r.length === n);
+  }
+  const ID_SKIP = /^(연번|번호|순번|no|순)$/;
+
   /* 오래된 형식 안내 */
   const OLD_MSG = {
     hwp: '예전 한글 파일(.hwp)은 열 수 없어요. 한글에서 [다른 이름으로 저장 → 파일 형식: 한글 표준 문서(*.hwpx)]로 저장한 뒤 올려 주세요.',
@@ -171,6 +189,19 @@
   /* =================================================================
      1. 자료 파일 읽기  →  rows (줄마다 칸 글자 목록)
      ================================================================= */
+  function listsFromDoc(doc, name) {
+    const out = [];
+    els(doc, 'tbl').forEach(tbl => {
+      const grid = tableGrid(tbl), texts = grid.map(r => r.map(cellText));
+      if (!isListTable(grid, texts)) return;
+      const headers = texts[0].map(norm);
+      const records = texts.slice(1).filter(r => r.some(Boolean)).map(r => {
+        const o = {}; headers.forEach((h, i) => { o[h] = r[i]; }); return o;
+      });
+      out.push({ name, headers, records });
+    });
+    return out;
+  }
   function rowsFromDoc(doc) {
     const rows = [];
     els(doc, 'tr').forEach(tr => rows.push(kids(tr, 'tc').map(cellText)));
@@ -234,14 +265,25 @@
         a.forEach(r => rows.push(r));
         rows.push([]);
       });
-      return { name, rows, headers };
+      const lists = [];
+      headers.forEach(r0 => {
+        const hs = rows[r0].map(norm), records = [];
+        for (let r = r0 + 1; r < rows.length && rows[r].some(Boolean); r++) {
+          const o = {}; hs.forEach((h, i) => { if (h) o[h] = rows[r][i] || ''; }); records.push(o);
+        }
+        lists.push({ name, headers: hs.filter(Boolean), records });
+      });
+      return { name, rows, headers, lists };
     }
     if (['hwpx', 'docx', 'pptx'].includes(ext)) {
       const zip = await root.JSZip.loadAsync(buf);
-      const rows = [];
-      for (const path of xmlParts(zip, ext))
-        rows.push(...rowsFromDoc(parseXml(await zip.file(path).async('string'))), []);
-      return { name, rows };
+      const rows = [], lists = [];
+      for (const path of xmlParts(zip, ext)) {
+        const doc = parseXml(await zip.file(path).async('string'));
+        rows.push(...rowsFromDoc(doc), []);
+        lists.push(...listsFromDoc(doc, name));
+      }
+      return { name, rows, lists };
     }
     if (ext === 'pdf') return { name, rows: await pdfRows(buf) };
     if (ext === 'txt') {
@@ -289,6 +331,37 @@
       if (m && norm(m[1]) === key) return { value: m[2].trim(), from: d.name };
     }
     return null;
+  }
+
+  /* 명단 표 맞추기: 양식의 줄마다 자료의 같은 사람(줄)을 찾아 빈칸 채우기 */
+  function matchLists(formLists, datas) {
+    const dataLists = [];
+    datas.forEach(d => (d.lists || []).forEach(l => dataLists.push(l)));
+    return formLists.map(fl => {
+      const hs = fl.headers.map(norm);
+      const overlap = l => hs.filter(h => l.headers.includes(h)).length;
+      const cands = dataLists.filter(l => overlap(l) >= Math.max(1, Math.ceil(hs.length / 2)))
+        .sort((a, b) => overlap(b) - overlap(a));
+      const best = cands[0];
+      const used = new Set();
+      let order = 0;
+      return fl.rows.map(cells => {
+        const ids = [];
+        cells.forEach((v, i) => { if (v && !ID_SKIP.test(hs[i])) ids.push([hs[i], norm(v)]); });
+        let rec = null, from = '';
+        if (ids.length) {
+          for (const l of cands) {
+            rec = l.records.find(r => !used.has(r) && ids.every(([h, v]) => r[h] != null && norm(r[h]) === v));
+            if (rec) { from = l.name; break; }
+          }
+        } else if (best) {
+          while (order < best.records.length && used.has(best.records[order])) order++;
+          rec = best.records[order++] || null; from = best ? best.name : '';
+        }
+        if (rec) used.add(rec);
+        return { from, values: cells.map((v, i) => v ? null : (rec && rec[hs[i]] != null ? String(rec[hs[i]]) : '')) };
+      });
+    });
   }
 
   function matchAll(fields, datas) {
@@ -373,7 +446,7 @@
   async function loadZipForm(buf, ext) {
     const zip = await root.JSZip.loadAsync(buf);
     const fl = FieldList();
-    const docs = {}, markerParas = [], blanks = [];
+    const docs = {}, markerParas = [], blanks = [], lists = [];
     for (const path of xmlParts(zip, ext)) {
       const doc = parseXml(await zip.file(path).async('string'));
       docs[path] = doc;
@@ -387,9 +460,12 @@
       });
       // 표의 빈칸:  [성명][   ]  또는  위 칸 제목 / 아래 빈칸
       els(doc, 'tbl').forEach(tbl => {
-        const trs = kids(tbl, 'tr');
-        const rows = trs.map(tr => kids(tr, 'tc'));
+        const rows = tableGrid(tbl);
         const texts = rows.map(cells => cells.map(cellText));
+        if (isListTable(rows, texts)) {                       // 명단형 표
+          lists.push({ headers: texts[0], rows: texts.slice(1), tcs: rows.slice(1) });
+          return;
+        }
         rows.forEach((cells, r) => {
           const used = new Set();
           for (let i = 0; i < cells.length - 1; i++) {
@@ -409,8 +485,13 @@
     }
     return {
       fields: fl.list(),
-      async build(values) {
+      lists: lists.map(l => ({ headers: l.headers, rows: l.rows })),
+      async build(values, listFills) {
         markerParas.forEach(p => fillMarkerPara(p, values, ext));
+        lists.forEach((l, li) => l.tcs.forEach((cells, ri) => cells.forEach((tc, ci) => {
+          const v = listFills && listFills[li] && listFills[li][ri] && listFills[li][ri][ci];
+          if (v && cellText(tc) === '') writeIntoCell(tc, String(v), ext);
+        })));
         blanks.forEach(b => { const v = values[b.key]; if (v) writeIntoCell(b.tc, String(v), ext); });
         Object.keys(docs).forEach(path => zip.file(path, serXml(docs[path])));
         if (zip.file('mimetype')) {
@@ -624,7 +705,8 @@
     const first = await loadFormOnce(name, buf);
     return {
       fields: first.fields,
-      async build(values) { return (await loadFormOnce(name, buf)).build(values); }
+      lists: first.lists || [],
+      async build(values, listFills) { return (await loadFormOnce(name, buf)).build(values, listFills); }
     };
   }
   async function loadFormOnce(name, buf) {
@@ -646,7 +728,7 @@
     pdf: 'application/pdf'
   };
 
-  const api = { norm, extOf, readDataFile, loadForm, matchAll, MIME };
+  const api = { norm, extOf, readDataFile, loadForm, matchAll, matchLists, MIME };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.FormEngine = api;
 })(typeof window !== 'undefined' ? window : globalThis);
@@ -709,7 +791,8 @@
       <p style="font-size:15px;color:#4b5563;margin:6px 0 12px">
         초록 칸은 자료에서 찾은 내용, 노란 칸은 못 찾은 내용입니다. 칸을 눌러 직접 고칠 수 있어요.
       </p>
-      <table>
+      <div id="listBox"></div>
+      <table id="singleBox">
         <thead><tr><th>양식 항목</th><th>넣을 내용</th><th>찾은 곳</th></tr></thead>
         <tbody id="fieldBody"></tbody>
       </table>
@@ -754,6 +837,7 @@ let dataFiles = [];   // [{name, buf}]
 let formFile = null;  // {name, buf}
 let form = null;      // 양식 분석 결과
 let found = {};       // 항목별 찾은 값
+let listMatch = [];   // 명단 표별 채울 값
 
 /* ---------- 로그인 / 로그아웃 ---------- */
 $('loginBtn').onclick = async () => {
@@ -847,7 +931,7 @@ async function refresh() {
   try {
     say('양식을 살펴보는 중입니다…');
     if (!form) form = await E.loadForm(formFile.name, formFile.buf);
-    if (!form.fields.length) {
+    if (!form.fields.length && !form.lists.length) {
       say('양식에서 채울 칸을 찾지 못했어요. 빈칸 옆에 항목 이름(예: 성명)이 있는 표이거나, 채울 자리에 {{성명}}처럼 표시가 있어야 해요.', 'err');
       return;
     }
@@ -858,9 +942,19 @@ async function refresh() {
       catch (err) { say(f.name + ' : ' + err.message, 'err'); return; }
     }
     found = E.matchAll(form.fields, datas);
+    listMatch = E.matchLists(form.lists, datas);
     drawTable();
-    const n = form.fields.filter(f => found[f.key]).length;
-    say('양식 항목 ' + form.fields.length + '개 중 ' + n + '개를 자료에서 찾았습니다. 확인 후 ③ 출력을 눌러 주세요.', 'ok');
+    drawLists();
+    const parts = [];
+    if (form.fields.length) {
+      const n = form.fields.filter(f => found[f.key]).length;
+      parts.push('양식 항목 ' + form.fields.length + '개 중 ' + n + '개');
+    }
+    listMatch.forEach((rows, li) => {
+      const total = rows.length, hit = rows.filter(r => r.from).length;
+      parts.push('명단 표' + (listMatch.length > 1 ? (li + 1) : '') + ' ' + total + '줄 중 ' + hit + '줄');
+    });
+    say('자료에서 찾은 내용: ' + parts.join(', ') + '. 확인 후 ③ 출력을 눌러 주세요.', 'ok');
     $('outBtn').disabled = false;
   } catch (err) {
     form = null;
@@ -868,7 +962,46 @@ async function refresh() {
   }
 }
 
+function drawLists() {
+  const box = $('listBox');
+  box.innerHTML = '';
+  form.lists.forEach((l, li) => {
+    const wrap = document.createElement('div');
+    wrap.className = 'listWrap';
+    const t = document.createElement('table');
+    t.className = 'listTable';
+    const head = document.createElement('tr');
+    l.headers.forEach(h => { const th = document.createElement('th'); th.textContent = h; head.appendChild(th); });
+    t.appendChild(head);
+    l.rows.forEach((cells, ri) => {
+      const tr = document.createElement('tr');
+      const m = listMatch[li][ri];
+      cells.forEach((v, ci) => {
+        const td = document.createElement('td');
+        if (v) { td.textContent = v; td.className = 'fixed'; }
+        else {
+          const inp = document.createElement('input');
+          inp.value = m.values[ci] || '';
+          inp.className = inp.value ? 'found' : 'empty';
+          inp.dataset.li = li; inp.dataset.ri = ri; inp.dataset.ci = ci;
+          inp.oninput = () => { inp.className = inp.value ? 'found' : 'empty'; };
+          td.appendChild(inp);
+        }
+        tr.appendChild(td);
+      });
+      t.appendChild(tr);
+    });
+    const cap = document.createElement('p');
+    cap.className = 'listCap';
+    cap.textContent = '📋 명단 표' + (form.lists.length > 1 ? ' ' + (li + 1) : '') + ' (회색 칸 = 양식에 원래 있던 내용)';
+    wrap.appendChild(cap);
+    wrap.appendChild(t);
+    box.appendChild(wrap);
+  });
+}
+
 function drawTable() {
+  $('singleBox').classList.toggle('hidden', !form.fields.length);
   const body = $('fieldBody');
   body.innerHTML = '';
   form.fields.forEach(f => {
@@ -891,10 +1024,14 @@ function drawTable() {
 $('outBtn').onclick = async () => {
   const values = {};
   document.querySelectorAll('#fieldBody input').forEach(i => { values[i.dataset.key] = i.value.trim(); });
+  const listFills = form.lists.map(l => l.rows.map(r => r.map(() => '')));
+  document.querySelectorAll('#listBox input').forEach(i => {
+    listFills[+i.dataset.li][+i.dataset.ri][+i.dataset.ci] = i.value.trim();
+  });
   try {
     $('outBtn').disabled = true;
     say('완성 파일을 만드는 중입니다…');
-    const bytes = await form.build(values);
+    const bytes = await form.build(values, listFills);
     const ext = E.extOf(formFile.name);
     const base = formFile.name.replace(/\.[^.]+$/, '');
     const blob = new Blob([bytes], { type: E.MIME[ext] || 'application/octet-stream' });
