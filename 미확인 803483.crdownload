@@ -1,0 +1,191 @@
+/* =====================================================================
+   app.js  —  화면 동작 + 로그인
+   ★ 고칠 곳은 딱 한 군데: 아래 firebaseConfig 안의 내용 ★
+   ===================================================================== */
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+import {
+  getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged,
+  setPersistence, browserSessionPersistence
+} from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+
+/* ★★★ 파이어베이스에서 복사한 내용으로 이 부분을 바꿔 주세요 ★★★ */
+const firebaseConfig = {
+  apiKey: "여기에_붙여넣기",
+  authDomain: "여기에_붙여넣기",
+  projectId: "여기에_붙여넣기",
+  storageBucket: "여기에_붙여넣기",
+  messagingSenderId: "여기에_붙여넣기",
+  appId: "여기에_붙여넣기"
+};
+/* ★★★ 여기까지 ★★★ */
+
+const IDLE_MINUTES = 10;   // 사용이 없으면 자동 로그아웃 되는 시간(분)
+const MAX_DATA = 5;        // 자료 파일 최대 개수
+
+const auth = getAuth(initializeApp(firebaseConfig));
+setPersistence(auth, browserSessionPersistence); // 브라우저를 닫으면 자동 로그아웃
+
+const $ = id => document.getElementById(id);
+const E = window.FormEngine;
+
+/* ---------- 작업 내용 (화면 메모리에만 있음) ---------- */
+let dataFiles = [];   // [{name, buf}]
+let formFile = null;  // {name, buf}
+let form = null;      // 양식 분석 결과
+let found = {};       // 항목별 찾은 값
+
+/* ---------- 로그인 / 로그아웃 ---------- */
+$('loginBtn').onclick = async () => {
+  $('loginMsg').textContent = '';
+  try {
+    await signInWithEmailAndPassword(auth, $('email').value.trim(), $('pw').value);
+  } catch (e) {
+    $('loginMsg').textContent = '이메일 또는 비밀번호가 맞지 않습니다.';
+  }
+};
+$('pw').addEventListener('keydown', e => { if (e.key === 'Enter') $('loginBtn').click(); });
+
+async function logout() {
+  await signOut(auth);
+  location.reload();             // 화면을 새로 고쳐서 올린 자료를 모두 지움
+}
+$('logoutBtn').onclick = logout;
+
+onAuthStateChanged(auth, user => {
+  $('loginBox').classList.toggle('hidden', !!user);
+  $('appBox').classList.toggle('hidden', !user);
+  $('who').textContent = user ? user.email + ' 님' : '';
+  $('pw').value = '';
+});
+
+/* 10분 동안 아무것도 안 하면 자동 로그아웃 */
+let idleTimer;
+function resetIdle() {
+  clearTimeout(idleTimer);
+  idleTimer = setTimeout(() => { if (auth.currentUser) logout(); }, IDLE_MINUTES * 60 * 1000);
+}
+['click', 'keydown', 'mousemove', 'touchstart'].forEach(ev => document.addEventListener(ev, resetIdle));
+resetIdle();
+
+/* ---------- 메시지 ---------- */
+function say(text, kind = 'info') { $('msg').className = kind; $('msg').textContent = text; }
+
+/* ---------- ① 자료 넣기 ---------- */
+$('dataBtn').onclick = () => $('dataInput').click();
+$('dataInput').onchange = async e => {
+  const picked = Array.from(e.target.files);
+  e.target.value = '';
+  if (dataFiles.length + picked.length > MAX_DATA) {
+    say('자료 파일은 최대 ' + MAX_DATA + '개까지 넣을 수 있어요.', 'err');
+    picked.splice(MAX_DATA - dataFiles.length);
+  }
+  for (const f of picked) dataFiles.push({ name: f.name, buf: await f.arrayBuffer() });
+  showFiles();
+  refresh();
+};
+
+/* ---------- ② 양식 넣기 ---------- */
+$('formBtn').onclick = () => $('formInput').click();
+$('formInput').onchange = async e => {
+  const f = e.target.files[0];
+  e.target.value = '';
+  if (!f) return;
+  formFile = { name: f.name, buf: await f.arrayBuffer() };
+  form = null;
+  showFiles();
+  refresh();
+};
+
+function showFiles() {
+  $('dataList').innerHTML = '';
+  dataFiles.forEach((f, i) => {
+    const li = document.createElement('li');
+    li.innerHTML = '<span></span><button title="빼기">✕</button>';
+    li.firstChild.textContent = '📄 ' + f.name;
+    li.lastChild.onclick = () => { dataFiles.splice(i, 1); showFiles(); refresh(); };
+    $('dataList').appendChild(li);
+  });
+  $('dataBtn').disabled = dataFiles.length >= MAX_DATA;
+
+  $('formList').innerHTML = '';
+  if (formFile) {
+    const li = document.createElement('li');
+    li.innerHTML = '<span></span><button title="빼기">✕</button>';
+    li.firstChild.textContent = '📝 ' + formFile.name;
+    li.lastChild.onclick = () => { formFile = null; form = null; showFiles(); refresh(); };
+    $('formList').appendChild(li);
+  }
+}
+
+/* ---------- 자료와 양식을 맞춰 보기 ---------- */
+async function refresh() {
+  $('outBtn').disabled = true;
+  $('tableBox').classList.add('hidden');
+  if (!formFile) { say(dataFiles.length ? '이제 ② 양식을 넣어 주세요.' : '① 자료와 ② 양식을 넣어 주세요.'); return; }
+
+  try {
+    say('양식을 살펴보는 중입니다…');
+    if (!form) form = await E.loadForm(formFile.name, formFile.buf);
+    if (!form.fields.length) {
+      say('양식에서 채울 칸을 찾지 못했어요. 빈칸 옆에 항목 이름(예: 성명)이 있는 표이거나, 채울 자리에 {{성명}}처럼 표시가 있어야 해요.', 'err');
+      return;
+    }
+
+    const datas = [];
+    for (const f of dataFiles) {
+      try { datas.push(await E.readDataFile(f.name, f.buf)); }
+      catch (err) { say(f.name + ' : ' + err.message, 'err'); return; }
+    }
+    found = E.matchAll(form.fields, datas);
+    drawTable();
+    const n = form.fields.filter(f => found[f.key]).length;
+    say('양식 항목 ' + form.fields.length + '개 중 ' + n + '개를 자료에서 찾았습니다. 확인 후 ③ 출력을 눌러 주세요.', 'ok');
+    $('outBtn').disabled = false;
+  } catch (err) {
+    form = null;
+    say(err.message || '양식을 읽지 못했어요.', 'err');
+  }
+}
+
+function drawTable() {
+  const body = $('fieldBody');
+  body.innerHTML = '';
+  form.fields.forEach(f => {
+    const hit = found[f.key];
+    const tr = document.createElement('tr');
+    tr.innerHTML = '<td class="label"></td><td><input></td><td class="from"></td>';
+    tr.children[0].textContent = f.label;
+    const input = tr.querySelector('input');
+    input.value = hit ? hit.value : '';
+    input.dataset.key = f.key;
+    input.className = hit ? 'found' : 'empty';
+    input.oninput = () => { input.className = input.value ? 'found' : 'empty'; };
+    tr.children[2].textContent = hit ? hit.from : '못 찾음';
+    body.appendChild(tr);
+  });
+  $('tableBox').classList.remove('hidden');
+}
+
+/* ---------- ③ 출력하기 ---------- */
+$('outBtn').onclick = async () => {
+  const values = {};
+  document.querySelectorAll('#fieldBody input').forEach(i => { values[i.dataset.key] = i.value.trim(); });
+  try {
+    $('outBtn').disabled = true;
+    say('완성 파일을 만드는 중입니다…');
+    const bytes = await form.build(values);
+    const ext = E.extOf(formFile.name);
+    const base = formFile.name.replace(/\.[^.]+$/, '');
+    const blob = new Blob([bytes], { type: E.MIME[ext] || 'application/octet-stream' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = base + '_완성.' + ext;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    say('✅ 출력 완료! [' + a.download + '] 파일을 확인하세요. 다른 분이 쓰도록 다 쓰셨으면 로그아웃을 눌러 주세요.', 'ok');
+  } catch (err) {
+    say('출력 중 문제가 생겼어요: ' + (err.message || err), 'err');
+  } finally {
+    $('outBtn').disabled = false;
+  }
+};

@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>사무자동화 도우미</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: #f3f5f9; color: #1f2937;
+    font-family: "맑은 고딕", "Malgun Gothic", "Apple SD Gothic Neo", sans-serif;
+    font-size: 18px; line-height: 1.6;
+  }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 24px 18px 60px; }
+  header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 18px; }
+  h1 { font-size: 28px; margin: 0; color: #1e3a8a; }
+  .who { font-size: 15px; color: #6b7280; margin-right: 10px; }
+  .card { background: #fff; border-radius: 16px; padding: 22px; box-shadow: 0 2px 10px rgba(0,0,0,.06); margin-bottom: 18px; }
+  .notice { font-size: 15px; color: #4b5563; background: #eef2ff; border-radius: 10px; padding: 10px 14px; margin-bottom: 18px; }
+
+  /* 로그인 */
+  #loginBox { max-width: 420px; margin: 80px auto; }
+  #loginBox h1 { text-align: center; margin-bottom: 20px; }
+  label { display: block; font-weight: bold; margin: 12px 0 6px; }
+  input[type=email], input[type=password] {
+    width: 100%; padding: 14px; font-size: 18px; border: 2px solid #d1d5db; border-radius: 10px;
+  }
+
+  /* 3개 단계 버튼 */
+  .steps { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-bottom: 18px; }
+  .step { background: #fff; border-radius: 16px; padding: 18px; box-shadow: 0 2px 10px rgba(0,0,0,.06);
+          display: flex; flex-direction: column; }
+  .step h2 { font-size: 20px; margin: 0 0 4px; }
+  .step .hint { font-size: 14px; color: #6b7280; margin-bottom: 12px; }
+  .big {
+    width: 100%; padding: 18px 10px; font-size: 21px; font-weight: bold; border: 0; border-radius: 12px;
+    color: #fff; cursor: pointer;
+  }
+  .big:disabled { background: #cbd5e1 !important; cursor: not-allowed; }
+  .b1 { background: #2563eb; } .b2 { background: #059669; } .b3 { background: #dc2626; }
+  .btn { padding: 10px 18px; font-size: 16px; border-radius: 10px; border: 2px solid #94a3b8; background: #fff; cursor: pointer; }
+  .btn.dark { background: #334155; color: #fff; border-color: #334155; }
+  ul.files { list-style: none; padding: 0; margin: 12px 0 0; font-size: 15px; }
+  ul.files li { background: #f8fafc; border: 1px solid #e5e7eb; border-radius: 8px; padding: 6px 10px; margin-bottom: 6px;
+                display: flex; justify-content: space-between; align-items: center; gap: 8px; word-break: break-all; }
+  ul.files button { border: 0; background: #fee2e2; color: #b91c1c; border-radius: 6px; padding: 2px 8px; cursor: pointer; font-size: 15px; }
+
+  /* 채울 내용 표 */
+  table { width: 100%; border-collapse: collapse; }
+  th, td { border-bottom: 1px solid #e5e7eb; padding: 10px 8px; text-align: left; vertical-align: middle; }
+  th { background: #f1f5f9; font-size: 16px; }
+  td.label { font-weight: bold; width: 26%; }
+  td.from { font-size: 13px; color: #6b7280; width: 24%; }
+  td input { width: 100%; padding: 10px; font-size: 17px; border: 2px solid #d1d5db; border-radius: 8px; }
+  td input.found { border-color: #22c55e; background: #f0fdf4; }
+  td input.empty { border-color: #f59e0b; background: #fffbeb; }
+  #msg { min-height: 28px; font-weight: bold; }
+  .ok { color: #047857; } .err { color: #b91c1c; } .info { color: #1d4ed8; }
+  .hidden { display: none !important; }
+  @media (max-width: 760px) { .steps { grid-template-columns: 1fr; } }
+</style>
+
+<!-- 파일을 읽고 만드는 도구들 (인터넷에서 불러옴) -->
+<script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+<script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/pdf-lib@1.17.1/dist/pdf-lib.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@pdf-lib/fontkit@1.1.1/dist/fontkit.umd.min.js"></script>
+<script>
+  pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js';
+</script>
+<script src="engine.js"></script>
+</head>
+<body>
+
+<!-- ===== 로그인 화면 ===== -->
+<div id="loginBox" class="card">
+  <h1>사무자동화 도우미</h1>
+  <label for="email">이메일</label>
+  <input id="email" type="email" autocomplete="username">
+  <label for="pw">비밀번호</label>
+  <input id="pw" type="password" autocomplete="current-password">
+  <p id="loginMsg" class="err"></p>
+  <button id="loginBtn" class="big b1">로그인</button>
+</div>
+
+<!-- ===== 작업 화면 ===== -->
+<div id="appBox" class="wrap hidden">
+  <header>
+    <h1>사무자동화 도우미</h1>
+    <div><span id="who" class="who"></span><button id="logoutBtn" class="btn dark">로그아웃</button></div>
+  </header>
+
+  <div class="notice">
+    🔒 올린 파일은 이 컴퓨터 안에서만 처리되고 어디에도 저장되지 않습니다.
+    다 쓰신 뒤 <b>로그아웃</b>을 누르면 모든 내용이 지워집니다. (10분 동안 사용이 없으면 자동 로그아웃)
+  </div>
+
+  <div class="steps">
+    <div class="step">
+      <h2>① 자료 넣기</h2>
+      <div class="hint">내용이 들어 있는 파일 (최대 5개)<br>한글(hwpx)·엑셀·파워포인트·워드·PDF</div>
+      <button id="dataBtn" class="big b1">자료 파일 고르기</button>
+      <input id="dataInput" type="file" multiple class="hidden"
+             accept=".hwpx,.hwp,.xlsx,.xls,.xlsm,.csv,.pptx,.ppt,.docx,.doc,.pdf,.txt">
+      <ul id="dataList" class="files"></ul>
+    </div>
+    <div class="step">
+      <h2>② 양식 넣기</h2>
+      <div class="hint">채울 빈 양식 파일 (1개)<br>한글(hwpx)·엑셀(xlsx)·파워포인트·워드·PDF</div>
+      <button id="formBtn" class="big b2">양식 파일 고르기</button>
+      <input id="formInput" type="file" class="hidden"
+             accept=".hwpx,.hwp,.xlsx,.xls,.xlsm,.pptx,.ppt,.docx,.doc,.pdf">
+      <ul id="formList" class="files"></ul>
+    </div>
+    <div class="step">
+      <h2>③ 출력하기</h2>
+      <div class="hint">아래 내용을 확인한 뒤<br>양식과 같은 형식으로 내려받기</div>
+      <button id="outBtn" class="big b3" disabled>완성 파일 출력</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div id="msg" class="info">① 자료와 ② 양식을 넣어 주세요.</div>
+    <div id="tableBox" class="hidden">
+      <p style="font-size:15px;color:#4b5563;margin:6px 0 12px">
+        초록 칸은 자료에서 찾은 내용, 노란 칸은 못 찾은 내용입니다. 칸을 눌러 직접 고칠 수 있어요.
+      </p>
+      <table>
+        <thead><tr><th>양식 항목</th><th>넣을 내용</th><th>찾은 곳</th></tr></thead>
+        <tbody id="fieldBody"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>
