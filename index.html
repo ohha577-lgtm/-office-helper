@@ -229,11 +229,30 @@
       return { text: memo.get(o), own: o.r0 === r && o.c0 === c, tall: o.rs > 1, tc: o.tc };
     }));
   }
-  function isListGrid(g) {                                   // 제목 줄 + 2줄 이상
-    return g.length >= 3 && g[0].length >= 2 && g[0].every(x => isLabel(x.text));
+  /* 제목 줄인지: 모두 항목 이름이어야 함. 단 맨 왼쪽 칸(날짜·이름 줄)은 비어 있어도 됨 */
+  function isHeaderRow(texts) {
+    const n = texts.filter(isLabel).length;
+    return texts.length >= 2 && n >= 2 && texts.every((s, i) => isLabel(s) || (i === 0 && !String(s || '').trim()));
   }
+  function isListGrid(g) {                                   // 제목 줄 + 2줄 이상
+    return g.length >= 3 && isHeaderRow(g[0].map(x => x.text));
+  }
+  /* 항목 이름을 비교용 열쇠로: 제목이 빈 칸이면 '#칸번호' */
+  function headKey(s, i) { return norm(s) || ('#' + i); }
+  /* 칸 값을 비교용으로: 날짜는 형식이 달라도 같은 날이면 같게 (2024-12-31 = 12-31(화) = 12/31/24) */
+  function dateKey(s) {
+    s = String(s == null ? '' : s).trim();
+    let m = /^(\d{4})\s*[-./년]\s*(\d{1,2})\s*[-./월]\s*(\d{1,2})\s*일?\s*(\(.{1,3}\))?$/.exec(s);
+    if (m) return +m[2] + '-' + +m[3];
+    m = /^(\d{1,2})\s*[-.월]\s*(\d{1,2})\s*일?\s*(\(.{1,3}\))?$/.exec(s);
+    if (m && +m[1] <= 12 && +m[2] <= 31) return +m[1] + '-' + +m[2];
+    m = /^(\d{1,2})\/(\d{1,2})(\/\d{2,4})?\s*(\(.{1,3}\))?$/.exec(s);
+    if (m && +m[1] <= 12 && +m[2] <= 31) return +m[1] + '-' + +m[2];
+    return null;
+  }
+  function valKey(s) { const d = dateKey(s); return d ? 'D' + d : norm(s); }
   function listFromGrid(g, name) {
-    const headers = g[0].map(x => norm(x.text));
+    const headers = g[0].map((x, i) => headKey(x.text, i));
     const records = g.slice(1).filter(row => row.some(x => x.own && x.text)).map(row => {
       const o = {}; headers.forEach((h, i) => { if (h && o[h] == null) o[h] = row[i].text; }); return o;
     });
@@ -324,8 +343,12 @@
     const same = (a, b) => Math.abs(a.x1 - b.x1) < T && Math.abs(a.x2 - b.x2) < T && Math.abs(a.y1 - b.y1) < T && Math.abs(a.y2 - b.y2) < T;
     let rects = [];
     raw.forEach(r => { if (!rects.some(q => same(q, r))) rects.push(r); });
-    const inside = (a, b) => a !== b && a.x1 >= b.x1 - T && a.x2 <= b.x2 + T && a.y1 >= b.y1 - T && a.y2 <= b.y2 + T;
-    rects = rects.filter(b => rects.filter(a => inside(a, b)).length < 2);   // 표 바깥 테두리 등은 빼기
+    // 작은 칸부터 고르고, 이미 고른 칸과 크게 겹치는 큰 사각형(표 테두리·줄 전체 배경)은 빼기
+    const area = r => (r.x2 - r.x1) * (r.y2 - r.y1);
+    const overlap = (a, b) => Math.min(a.x2, b.x2) - Math.max(a.x1, b.x1) > 2 && Math.min(a.y2, b.y2) - Math.max(a.y1, b.y1) > 2;
+    const kept = [];
+    rects.sort((a, b) => area(a) - area(b)).forEach(r => { if (!kept.some(k => overlap(k, r))) kept.push(r); });
+    rects = kept;
     // 서로 맞닿은 칸끼리 한 표로 묶기
     const touch = (a, b) => a.x1 <= b.x2 + 1.5 && b.x1 <= a.x2 + 1.5 && a.y1 <= b.y2 + 1.5 && b.y1 <= a.y2 + 1.5;
     const groups = [];
@@ -428,7 +451,7 @@
         // 첫 줄이 '성명 | 학년 | 반 …' 같은 제목 줄인지 살펴보기 (명단형 표)
         if (a.length >= 2) {
           const h = a[0].filter(Boolean), d = a[1].filter(Boolean);
-          if (h.length >= 3 && a[0].every(c => !c || isLabel(c) && !/\d/.test(c)) && d.length >= h.length - 1)
+          if (h.length >= 2 && a[0].every(c => !c || isLabel(c) && !/\d/.test(c)) && d.length >= 1)
             headers.add(rows.length);
         }
         a.forEach(r => rows.push(r));
@@ -436,7 +459,7 @@
       });
       const lists = [];
       headers.forEach(r0 => {
-        const hs = rows[r0].map(norm), records = [];
+        const hs = rows[r0].map(headKey), records = [];
         for (let r = r0 + 1; r < rows.length && rows[r].some(Boolean); r++) {
           const o = {}; hs.forEach((h, i) => { if (h) o[h] = rows[r][i] || ''; }); records.push(o);
         }
@@ -507,7 +530,7 @@
     const dataLists = [];
     datas.forEach(d => (d.lists || []).forEach(l => dataLists.push(l)));
     return formLists.map(fl => {
-      const hs = fl.headers.map(norm);
+      const hs = fl.headers.map(headKey);
       const overlap = l => hs.filter(h => l.headers.includes(h)).length;
       const cands = dataLists.filter(l => overlap(l) >= Math.max(1, Math.ceil(hs.length / 2)))
         .sort((a, b) => overlap(b) - overlap(a));
@@ -518,18 +541,18 @@
         const skip = (fl.skip && fl.skip[ri]) || [], tall = (fl.tall && fl.tall[ri]) || [];
         const ids = [];
         // 여러 줄을 합친 칸(예: 부서)은 사람 찾기에 쓰지 않음
-        cells.forEach((v, i) => { if (v && !skip[i] && !tall[i] && !ID_SKIP.test(hs[i])) ids.push([hs[i], norm(v)]); });
+        cells.forEach((v, i) => { if (v && !skip[i] && !tall[i] && !ID_SKIP.test(hs[i])) ids.push([hs[i], valKey(v)]); });
         let rec = null, from = '';
         if (ids.length) {
           for (const l of cands) {
-            rec = l.records.find(r => !used.has(r) && ids.every(([h, v]) => r[h] != null && norm(r[h]) === v));
+            rec = l.records.find(r => !used.has(r) && ids.every(([h, v]) => r[h] != null && valKey(r[h]) === v));
             if (rec) { from = l.name; break; }
           }
           if (!rec) {                                          // 다 맞지 않으면 가장 많이 맞는 줄
             let top = 0;
             cands.forEach(l => l.records.forEach(r => {
               if (used.has(r)) return;
-              const n = ids.filter(([h, v]) => r[h] != null && norm(r[h]) === v).length;
+              const n = ids.filter(([h, v]) => r[h] != null && valKey(r[h]) === v).length;
               if (n > top && n * 2 >= ids.length) { top = n; rec = r; from = l.name; }
             }));
           }
@@ -712,8 +735,41 @@
       return v ? v.textContent.trim() : '';
     };
     const isTextCell = c => ['s', 'inlineStr', 'str'].includes(c.getAttribute('t'));
+    // 날짜 서식인 칸 알아보기 (엑셀은 날짜를 45657 같은 숫자로 저장함)
+    let xfFmt = [];
+    const customFmt = {};
+    if (zip.file('xl/styles.xml')) {
+      const st = parseXml(await zip.file('xl/styles.xml').async('string'));
+      els(st, 'numFmt').forEach(n => { customFmt[n.getAttribute('numFmtId')] = n.getAttribute('formatCode') || ''; });
+      const cx = els(st, 'cellXfs')[0];
+      // 한컴 셀 파일은 서식 하나를 <AlternateContent>로 감싸 두기도 함 → 그 안의 Fallback 서식을 씀
+      if (cx) for (let n = cx.firstChild; n; n = n.nextSibling) {
+        if (n.nodeType !== 1) continue;
+        if (n.localName === 'xf') xfFmt.push(n.getAttribute('numFmtId'));
+        else if (n.localName === 'AlternateContent') {
+          const fb = kids(n, 'Fallback')[0] || kids(n, 'Choice')[0];
+          const x = fb && kids(fb, 'xf')[0];
+          xfFmt.push(x ? x.getAttribute('numFmtId') : '0');
+        }
+      }
+    }
+    const isDateStyle = c => {
+      const id = +(xfFmt[+(c.getAttribute('s') || 0)] || 0);
+      if ((id >= 14 && id <= 22) || (id >= 27 && id <= 36) || (id >= 45 && id <= 47) || (id >= 50 && id <= 58)) return true;
+      const code = (customFmt[id] || '').replace(/"[^"]*"|\[[^\]]*\]/g, '');
+      return /[yd]/i.test(code) || /m{1,2}\W{0,3}d|aaa/i.test(code);
+    };
+    const pad = n => (n < 10 ? '0' : '') + n;
+    const showCell = (c, dateCol) => {               // 화면에 보일 글자 (날짜는 2024-12-31 모양)
+      const s = cellStr(c);
+      if (!c.getAttribute('t') && /^\d+(\.\d+)?$/.test(s) && +s > 0 && +s < 2958466 && (dateCol || isDateStyle(c))) {
+        const d = new Date(Date.UTC(1899, 11, 30) + Math.floor(+s) * 86400000);
+        return d.getUTCFullYear() + '-' + pad(d.getUTCMonth() + 1) + '-' + pad(d.getUTCDate());
+      }
+      return s;
+    };
 
-    const sheets = {}, blanks = [], markerItems = [];
+    const sheets = {}, blanks = [], markerItems = [], lists = [];
     // 표시: 공유 문자열 + 칸 안 문자열
     const scanMarks = node => {
       const s = textOf(node);
@@ -747,9 +803,46 @@
       };
       const usedLabels = new Set();
       const sorted = Array.from(cells.values()).sort((a, b) => a.row - b.row || a.col - b.col);
+      // 명단형 표: 제목 줄(OK|LP|금…) 아래로 여러 줄 — 줄마다 같은 날짜·사람의 자료를 채움
+      const inList = new Set();
+      const txt = (r, c) => { const x = cells.get(r + ',' + c); return x && !hidden(r, c) ? cellStr(x.el) : ''; };
+      const rowNums = Array.from(new Set(sorted.map(x => x.row))).sort((a, b) => a - b);
+      let listEnd = 0;
+      for (const r of rowNums) {
+        if (r <= listEnd) continue;
+        const full = sorted.filter(x => x.row === r && !hidden(r, x.col) && cellStr(x.el) !== '');
+        if (full.length < 2 || !full.every(x => isTextCell(x.el) && isLabel(cellStr(x.el)))) continue;
+        const c1 = Math.min(...full.map(x => x.col)), c2 = Math.max(...full.map(x => x.col));
+        let ok = true;
+        for (let c = c1; c <= c2; c++) if (!isLabel(txt(r, c))) { ok = false; break; }
+        if (!ok) continue;
+        // 제목이 빈 맨 왼쪽 칸 아래에 날짜·이름이 있으면 그 칸도 표에 넣기
+        const cs = c1 > 1 && !txt(r, c1 - 1) && txt(r + 1, c1 - 1) ? c1 - 1 : c1;
+        const body = [];
+        for (let rr = r + 1; ; rr++) {
+          let any = false;
+          for (let c = cs; c <= c2; c++) if (cells.has(rr + ',' + c)) any = true;
+          if (!any) break;
+          body.push(rr);
+        }
+        if (body.length < 2) continue;
+        const colsList = [];
+        for (let c = cs; c <= c2; c++) colsList.push(c);
+        // 같은 열에 날짜 서식 칸이 하나라도 있으면 그 열의 숫자는 모두 날짜로 봄
+        const dateCols = colsList.map(c => body.some(rr => { const x = cells.get(rr + ',' + c); return x && !x.el.getAttribute('t') && cellStr(x.el) !== '' && isDateStyle(x.el); }));
+        lists.push({
+          doc,
+          headers: colsList.map(c => txt(r, c)),
+          rows: body.map(rr => colsList.map((c, ci) => { const x = cells.get(rr + ',' + c); return x && !hidden(rr, c) ? showCell(x.el, dateCols[ci]) : ''; })),
+          skip: body.map(rr => colsList.map(c => !!hidden(rr, c))),
+          pos: body.map(rr => colsList.map(c => ({ row: rr, col: c })))
+        });
+        [r].concat(body).forEach(rr => colsList.forEach(c => inList.add(rr + ',' + c)));
+        listEnd = body[body.length - 1];
+      }
       // 가로형 [성명][  ]
       sorted.forEach(x => {
-        if (hidden(x.row, x.col) || !isTextCell(x.el)) return;
+        if (hidden(x.row, x.col) || !isTextCell(x.el) || inList.has(x.row + ',' + x.col)) return;
         const label = cellStr(x.el);
         if (!isLabel(label)) return;
         const m = mergeOf(x.row, x.col);
@@ -759,7 +852,7 @@
       // 세로형: 제목 줄 아래가 빈칸
       const byRow = {};
       sorted.forEach(x => {
-        if (hidden(x.row, x.col) || !isTextCell(x.el) || usedLabels.has(x.row + ',' + x.col)) return;
+        if (hidden(x.row, x.col) || !isTextCell(x.el) || usedLabels.has(x.row + ',' + x.col) || inList.has(x.row + ',' + x.col)) return;
         const label = cellStr(x.el);
         if (!isLabel(label)) return;
         const m = mergeOf(x.row, x.col);
@@ -771,25 +864,55 @@
       });
     }
 
+    const colName = n => { let s = ''; while (n > 0) { const m = (n - 1) % 26; s = String.fromCharCode(65 + m) + s; n = Math.floor((n - 1) / 26); } return s; };
+    // 칸이 없으면 새로 만들기 (줄 순서·칸 순서 맞춰서)
+    const cellAt = (doc, row, col) => {
+      const sd = els(doc, 'sheetData')[0];
+      if (!sd) return null;
+      const ns = sd.namespaceURI, pre = sd.prefix ? sd.prefix + ':' : '';
+      let rowEl = kids(sd, 'row').find(x => +x.getAttribute('r') === row);
+      if (!rowEl) {
+        rowEl = doc.createElementNS(ns, pre + 'row');
+        rowEl.setAttribute('r', String(row));
+        sd.insertBefore(rowEl, kids(sd, 'row').find(x => +x.getAttribute('r') > row) || null);
+      }
+      const ref = colName(col) + row;
+      let c = kids(rowEl, 'c').find(x => x.getAttribute('r') === ref);
+      if (!c) {
+        c = doc.createElementNS(ns, pre + 'c');
+        c.setAttribute('r', ref);
+        rowEl.insertBefore(c, kids(rowEl, 'c').find(x => (parseRef(x.getAttribute('r')) || {}).col > col) || null);
+        rowEl.removeAttribute('spans');
+      }
+      return c;
+    };
+    const putValue = (c, v) => {
+      const ns = c.namespaceURI, doc = c.ownerDocument, pre = c.prefix ? c.prefix + ':' : '';
+      ['v', 'f', 'is'].forEach(n => kids(c, n).forEach(x => c.removeChild(x)));
+      const s = String(v).trim();
+      // 434,650 같은 숫자는 숫자로 넣어야 엑셀 계산·서식이 그대로 됨
+      if (/^-?(0|[1-9]\d{0,14})(\.\d+)?$/.test(s) || /^-?\d{1,3}(,\d{3})+(\.\d+)?$/.test(s)) {
+        c.removeAttribute('t');
+        const ve = doc.createElementNS(ns, pre + 'v'); ve.textContent = s.replace(/,/g, ''); c.appendChild(ve);
+      } else {
+        c.setAttribute('t', 'inlineStr');
+        const is = doc.createElementNS(ns, pre + 'is'), t = doc.createElementNS(ns, pre + 't');
+        t.textContent = s; is.appendChild(t); c.appendChild(is);
+      }
+    };
+
     return {
       fields: fl.list(),
-      async build(values) {
+      lists: lists.map(l => ({ headers: l.headers, rows: l.rows, skip: l.skip })),
+      async build(values, listFills) {
         markerItems.forEach(node => fillMarkerPara(node, values, 'xlsx'));
-        blanks.forEach(b => {
-          const v = values[b.key];
-          if (!v) return;
-          const c = b.el, ns = c.namespaceURI, doc = c.ownerDocument;
-          ['v', 'f', 'is'].forEach(n => kids(c, n).forEach(x => c.removeChild(x)));
-          const s = String(v);
-          if (/^-?(0|[1-9]\d{0,14})(\.\d+)?$/.test(s)) {
-            c.removeAttribute('t');
-            const ve = doc.createElementNS(ns, 'v'); ve.textContent = s; c.appendChild(ve);
-          } else {
-            c.setAttribute('t', 'inlineStr');
-            const is = doc.createElementNS(ns, 'is'), t = doc.createElementNS(ns, 't');
-            t.textContent = s; is.appendChild(t); c.appendChild(is);
-          }
-        });
+        blanks.forEach(b => { const v = values[b.key]; if (v) putValue(b.el, v); });
+        lists.forEach((l, li) => l.pos.forEach((cols, ri) => cols.forEach((p, ci) => {
+          const v = listFills && listFills[li] && listFills[li][ri] && listFills[li][ri][ci];
+          if (!v || l.rows[ri][ci] || l.skip[ri][ci]) return;        // 원래 내용이 있거나 합친 칸이면 그대로
+          const c = cellAt(l.doc, p.row, p.col);
+          if (c) putValue(c, v);
+        })));
         if (ss) zip.file('xl/sharedStrings.xml', serXml(ss));
         Object.keys(sheets).forEach(p => zip.file(p, serXml(sheets[p])));
         // 계산식이 있으면 파일을 열 때 다시 계산
