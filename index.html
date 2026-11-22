@@ -63,6 +63,7 @@
   td input { width: 100%; padding: 10px; font-size: 17px; border: 2px solid #d1d5db; border-radius: 8px; }
   td input.found { border-color: #22c55e; background: #f0fdf4; }
   td input.empty { border-color: #f59e0b; background: #fffbeb; }
+  td input.blank { border-color: #cbd5e1; background: #f8fafc; }
   .listWrap { overflow-x: auto; margin-bottom: 20px; }
   .listCap { font-weight: bold; margin: 4px 0 8px; }
   table.listTable th, table.listTable td { border: 1px solid #e5e7eb; padding: 4px; font-size: 15px; white-space: nowrap; }
@@ -170,11 +171,73 @@
   function tableGrid(tbl) {
     return kids(tbl, 'tr').map(tr => kids(tr, 'tc'));
   }
-  function isListTable(grid, texts) {
-    if (grid.length < 3) return false;                       // 제목 + 2줄 이상
-    const n = grid[0].length;
-    if (n < 2 || !texts[0].every(isLabel)) return false;
-    return grid.slice(1).every(r => r.length === n);
+  function attrOf(el, name) {
+    if (!el) return null;
+    for (const a of Array.from(el.attributes)) if (a.localName === name) return a.value;
+    return null;
+  }
+  /* 표를 '칸 지도'로 펼치기 — 여러 줄·여러 칸을 합친 칸도 제자리에 놓음 */
+  function tableMap(tbl) {
+    const at = [];
+    const put = (r, c, o) => { (at[r] = at[r] || [])[c] = o; };
+    kids(tbl, 'tr').forEach((tr, r) => {
+      at[r] = at[r] || [];
+      let c = 0;
+      kids(tr, 'tc').forEach(tc => {
+        const ns = tc.namespaceURI || '';
+        const addr = kids(tc, 'cellAddr')[0];
+        if (addr) {                                            // 한글(hwpx)
+          const sp = kids(tc, 'cellSpan')[0];
+          const o = { tc, r0: +attrOf(addr, 'rowAddr'), c0: +attrOf(addr, 'colAddr'),
+                      rs: +(attrOf(sp, 'rowSpan') || 1), cs: +(attrOf(sp, 'colSpan') || 1) };
+          for (let i = 0; i < o.rs; i++) for (let j = 0; j < o.cs; j++) put(o.r0 + i, o.c0 + j, o);
+          return;
+        }
+        while (at[r][c]) c++;
+        if (/wordprocessingml/.test(ns)) {                     // 워드(docx)
+          const pr = kids(tc, 'tcPr')[0];
+          const gs = pr && kids(pr, 'gridSpan')[0], vm = pr && kids(pr, 'vMerge')[0];
+          const cs = gs ? +(attrOf(gs, 'val') || 1) : 1;
+          let o;
+          if (vm && attrOf(vm, 'val') !== 'restart' && at[r - 1] && at[r - 1][c]) {
+            o = at[r - 1][c]; o.rs = r - o.r0 + 1;
+          } else o = { tc, r0: r, c0: c, rs: 1, cs };
+          for (let j = 0; j < cs; j++) put(r, c + j, o);
+          c += cs;
+          return;
+        }
+        // 파워포인트(pptx)
+        if (tc.getAttribute('hMerge') === '1' && at[r][c - 1]) { put(r, c, at[r][c - 1]); c++; return; }
+        if (tc.getAttribute('vMerge') === '1' && at[r - 1] && at[r - 1][c]) {
+          const o = at[r - 1][c]; o.rs = Math.max(o.rs, r - o.r0 + 1); put(r, c, o); c++; return;
+        }
+        put(r, c, { tc, r0: r, c0: c, rs: +(tc.getAttribute('rowSpan') || 1), cs: +(tc.getAttribute('gridSpan') || 1) });
+        c++;
+      });
+    });
+    return at;
+  }
+  /* 칸 지도 → 칸마다 {글자, 제자리 칸인지, 여러 줄 합친 칸인지} */
+  function gridOf(tbl) {
+    const at = tableMap(tbl);
+    const C = Math.max(0, ...at.map(r => (r ? r.length : 0)));
+    const memo = new Map();
+    return at.map((row, r) => Array.from({ length: C }, (_, c) => {
+      const o = row && row[c];
+      if (!o) return { text: '', own: false, tall: false, tc: null };
+      if (!memo.has(o)) memo.set(o, cellText(o.tc));
+      return { text: memo.get(o), own: o.r0 === r && o.c0 === c, tall: o.rs > 1, tc: o.tc };
+    }));
+  }
+  function isListGrid(g) {                                   // 제목 줄 + 2줄 이상
+    return g.length >= 3 && g[0].length >= 2 && g[0].every(x => isLabel(x.text));
+  }
+  function listFromGrid(g, name) {
+    const headers = g[0].map(x => norm(x.text));
+    const records = g.slice(1).filter(row => row.some(x => x.own && x.text)).map(row => {
+      const o = {}; headers.forEach((h, i) => { if (h && o[h] == null) o[h] = row[i].text; }); return o;
+    });
+    return { name, headers, records };
   }
   const ID_SKIP = /^(연번|번호|순번|no|순)$/;
 
@@ -192,13 +255,8 @@
   function listsFromDoc(doc, name) {
     const out = [];
     els(doc, 'tbl').forEach(tbl => {
-      const grid = tableGrid(tbl), texts = grid.map(r => r.map(cellText));
-      if (!isListTable(grid, texts)) return;
-      const headers = texts[0].map(norm);
-      const records = texts.slice(1).filter(r => r.some(Boolean)).map(r => {
-        const o = {}; headers.forEach((h, i) => { o[h] = r[i]; }); return o;
-      });
-      out.push({ name, headers, records });
+      const g = gridOf(tbl);
+      if (isListGrid(g)) out.push(listFromGrid(g, name));
     });
     return out;
   }
@@ -213,38 +271,149 @@
     return rows;
   }
 
-  async function pdfRows(buf) {
+  /* PDF 글자 조각들을 줄 단위로 묶고, 줄 안에서 가까운 조각끼리 한 칸으로 합치기 */
+  function pdfLines(items) {
+    const lines = [];
+    items.forEach(it => {
+      let line = lines.find(l => Math.abs(l.y - it.y) < it.h * 0.5);
+      if (!line) { line = { y: it.y, items: [] }; lines.push(line); }
+      line.items.push(it);
+    });
+    lines.sort((a, b) => b.y - a.y);
+    return lines.map(l => {
+      l.items.sort((a, b) => a.x - b.x);
+      const cells = [];
+      let cur = null;
+      l.items.forEach(it => {
+        const gap = cur ? it.x - (cur.x + cur.w) : 1e9;
+        if (cur && gap < it.h * 0.9) {
+          cur.s += (gap > it.h * 0.15 ? ' ' : '') + it.s;
+          cur.w = it.x + it.w - cur.x;
+        } else { cur = Object.assign({}, it); cells.push(cur); }
+      });
+      return { y: l.y, cells };
+    });
+  }
+
+  /* PDF 안의 칸 테두리(사각형)를 찾아 표를 되살리기 */
+  async function pdfTables(page) {
+    const lib = root.pdfjsLib, O = lib.OPS;
+    const ol = await page.getOperatorList();
+    const v = page.view, pw = v[2] - v[0], ph = v[3] - v[1];
+    let ctm = [1, 0, 0, 1, 0, 0];
+    const stack = [], raw = [];
+    const mul = (m, n) => [m[0] * n[0] + m[2] * n[1], m[1] * n[0] + m[3] * n[1], m[0] * n[2] + m[2] * n[3],
+      m[1] * n[2] + m[3] * n[3], m[0] * n[4] + m[2] * n[5] + m[4], m[1] * n[4] + m[3] * n[5] + m[5]];
+    const pt = (x, y) => [ctm[0] * x + ctm[2] * y + ctm[4], ctm[1] * x + ctm[3] * y + ctm[5]];
+    ol.fnArray.forEach((fn, i) => {
+      const a = ol.argsArray[i];
+      if (fn === O.save) stack.push(ctm.slice());
+      else if (fn === O.restore) ctm = stack.pop() || [1, 0, 0, 1, 0, 0];
+      else if (fn === O.transform) ctm = mul(ctm, a);
+      else if (fn === O.constructPath) {
+        const mm = a[2];
+        if (!mm || mm.length < 4 || !isFinite(mm[0])) return;
+        const ps = [pt(mm[0], mm[2]), pt(mm[1], mm[2]), pt(mm[0], mm[3]), pt(mm[1], mm[3])];
+        const xs = ps.map(p => p[0]), ys = ps.map(p => p[1]);
+        const r = { x1: Math.min(...xs), x2: Math.max(...xs), y1: Math.min(...ys), y2: Math.max(...ys) };
+        const w = r.x2 - r.x1, h = r.y2 - r.y1;
+        if (w > 4 && h > 4 && !(w > pw * 0.9 && h > ph * 0.9)) raw.push(r);
+      }
+    });
+    const T = 1;
+    const same = (a, b) => Math.abs(a.x1 - b.x1) < T && Math.abs(a.x2 - b.x2) < T && Math.abs(a.y1 - b.y1) < T && Math.abs(a.y2 - b.y2) < T;
+    let rects = [];
+    raw.forEach(r => { if (!rects.some(q => same(q, r))) rects.push(r); });
+    const inside = (a, b) => a !== b && a.x1 >= b.x1 - T && a.x2 <= b.x2 + T && a.y1 >= b.y1 - T && a.y2 <= b.y2 + T;
+    rects = rects.filter(b => rects.filter(a => inside(a, b)).length < 2);   // 표 바깥 테두리 등은 빼기
+    // 서로 맞닿은 칸끼리 한 표로 묶기
+    const touch = (a, b) => a.x1 <= b.x2 + 1.5 && b.x1 <= a.x2 + 1.5 && a.y1 <= b.y2 + 1.5 && b.y1 <= a.y2 + 1.5;
+    const groups = [];
+    rects.forEach(r => {
+      const hit = groups.filter(g => g.some(q => touch(q, r)));
+      const g = [r];
+      hit.forEach(h => { g.push(...h); groups.splice(groups.indexOf(h), 1); });
+      groups.push(g);
+    });
+    const edges = vals => {
+      const out = [];
+      vals.sort((a, b) => a - b).forEach(x => { if (!out.length || x - out[out.length - 1] > 1.5) out.push(x); });
+      return out;
+    };
+    const idx = (list, x) => { let b = 0; list.forEach((e, i) => { if (Math.abs(e - x) < Math.abs(list[b] - x)) b = i; }); return b; };
+    return groups.filter(g => g.length >= 6).map(g => {
+      const xs = edges(g.flatMap(r => [r.x1, r.x2]));
+      const ys = edges(g.flatMap(r => [r.y1, r.y2])).reverse();       // 위에서 아래로
+      g.forEach(r => {
+        r.c0 = idx(xs, r.x1); r.cs = Math.max(1, idx(xs, r.x2) - r.c0);
+        r.r0 = idx(ys, r.y2); r.rs = Math.max(1, idx(ys, r.y1) - r.r0);
+        r.items = [];
+      });
+      return { rects: g, R: ys.length - 1, C: xs.length - 1 };
+    });
+  }
+
+  function pdfCellText(r) {
+    const lines = pdfLines(r.items);
+    let out = '';
+    lines.forEach((l, i) => {
+      const s = l.cells.map(c => c.s.trim()).filter(Boolean).join(' ');
+      if (!s) return;
+      if (out) {
+        const prev = lines[i - 1], last = prev.cells[prev.cells.length - 1];
+        const full = last && last.x + last.w > r.x2 - last.h * 2.5;  // 칸 끝까지 차서 줄이 넘어간 경우
+        out += (full && !/[\s\/,·]$/.test(out) && !/^[\/(]/.test(s) ? '' : ' ');
+      }
+      out += s;
+    });
+    return out.trim();
+  }
+
+  async function pdfRows(buf, name) {
     const lib = root.pdfjsLib;
     const pdf = await lib.getDocument({ data: new Uint8Array(buf.slice(0)) }).promise;
-    const rows = [];
+    const rows = [], lists = [];
     for (let i = 1; i <= pdf.numPages; i++) {
       const page = await pdf.getPage(i);
       const tc = await page.getTextContent();
-      const lines = [];
+      const items = [];
       tc.items.forEach(it => {
         if (!it.str || !it.str.trim()) return;
-        const x = it.transform[4], y = it.transform[5];
         const h = Math.hypot(it.transform[2], it.transform[3]) || 10;
-        let line = lines.find(l => Math.abs(l.y - y) < h * 0.5);
-        if (!line) { line = { y, items: [] }; lines.push(line); }
-        line.items.push({ x, w: it.width, s: it.str, h });
+        items.push({ x: it.transform[4], y: it.transform[5], w: it.width, s: it.str, h });
       });
-      lines.sort((a, b) => b.y - a.y);
-      lines.forEach(l => {
-        l.items.sort((a, b) => a.x - b.x);
-        const cells = [];
-        let cur = null;
-        l.items.forEach(it => {
-          const gap = cur ? it.x - (cur.x + cur.w) : 1e9;
-          if (cur && gap < it.h * 0.9) {
-            cur.s += (gap > it.h * 0.15 ? ' ' : '') + it.s;
-            cur.w = it.x + it.w - cur.x;
-          } else { cur = Object.assign({}, it); cells.push(cur); }
+      let tables = [];
+      try { tables = await pdfTables(page); } catch (e) { tables = []; }
+      const loose = [];
+      items.forEach(it => {
+        const cx = it.x + it.w / 2, cy = it.y + it.h * 0.35;
+        let best = null;
+        tables.forEach(t => t.rects.forEach(r => {
+          if (cx >= r.x1 && cx <= r.x2 && cy >= r.y1 && cy <= r.y2 &&
+              (!best || (r.x2 - r.x1) * (r.y2 - r.y1) < (best.x2 - best.x1) * (best.y2 - best.y1))) best = r;
+        }));
+        if (best) best.items.push(it); else loose.push(it);
+      });
+      tables.forEach(t => {
+        const at = [];
+        t.rects.forEach(r => {
+          const o = { text: pdfCellText(r), r0: r.r0, c0: r.c0, rs: r.rs };
+          for (let a = 0; a < r.rs; a++) for (let b = 0; b < r.cs; b++) (at[r.r0 + a] = at[r.r0 + a] || [])[r.c0 + b] = o;
         });
-        rows.push(cells.map(c => c.s.trim()).filter(Boolean));
+        const g = [];
+        for (let r = 0; r < t.R; r++) {
+          g.push(Array.from({ length: t.C }, (_, c) => {
+            const o = at[r] && at[r][c];
+            return o ? { text: o.text, own: o.r0 === r && o.c0 === c, tall: o.rs > 1 } : { text: '', own: false, tall: false };
+          }));
+          rows.push(g[r].filter(x => x.own).map(x => x.text));
+        }
+        rows.push([]);
+        if (isListGrid(g)) lists.push(listFromGrid(g, name));
       });
+      pdfLines(loose).forEach(l => rows.push(l.cells.map(c => c.s.trim()).filter(Boolean)));
     }
-    return rows;
+    return { rows, lists };
   }
 
   async function readDataFile(name, buf) {
@@ -285,7 +454,7 @@
       }
       return { name, rows, lists };
     }
-    if (ext === 'pdf') return { name, rows: await pdfRows(buf) };
+    if (ext === 'pdf') { const r = await pdfRows(buf, name); return { name, rows: r.rows, lists: r.lists }; }
     if (ext === 'txt') {
       const txt = new TextDecoder('utf-8').decode(buf);
       return { name, rows: txt.split(/\r?\n/).map(s => s.trim()).filter(Boolean).map(s => [s]) };
@@ -345,21 +514,31 @@
       const best = cands[0];
       const used = new Set();
       let order = 0;
-      return fl.rows.map(cells => {
+      return fl.rows.map((cells, ri) => {
+        const skip = (fl.skip && fl.skip[ri]) || [], tall = (fl.tall && fl.tall[ri]) || [];
         const ids = [];
-        cells.forEach((v, i) => { if (v && !ID_SKIP.test(hs[i])) ids.push([hs[i], norm(v)]); });
+        // 여러 줄을 합친 칸(예: 부서)은 사람 찾기에 쓰지 않음
+        cells.forEach((v, i) => { if (v && !skip[i] && !tall[i] && !ID_SKIP.test(hs[i])) ids.push([hs[i], norm(v)]); });
         let rec = null, from = '';
         if (ids.length) {
           for (const l of cands) {
             rec = l.records.find(r => !used.has(r) && ids.every(([h, v]) => r[h] != null && norm(r[h]) === v));
             if (rec) { from = l.name; break; }
           }
+          if (!rec) {                                          // 다 맞지 않으면 가장 많이 맞는 줄
+            let top = 0;
+            cands.forEach(l => l.records.forEach(r => {
+              if (used.has(r)) return;
+              const n = ids.filter(([h, v]) => r[h] != null && norm(r[h]) === v).length;
+              if (n > top && n * 2 >= ids.length) { top = n; rec = r; from = l.name; }
+            }));
+          }
         } else if (best) {
           while (order < best.records.length && used.has(best.records[order])) order++;
           rec = best.records[order++] || null; from = best ? best.name : '';
         }
         if (rec) used.add(rec);
-        return { from, values: cells.map((v, i) => v ? null : (rec && rec[hs[i]] != null ? String(rec[hs[i]]) : '')) };
+        return { from, values: cells.map((v, i) => (v || skip[i]) ? null : (rec && rec[hs[i]] != null ? String(rec[hs[i]]) : '')) };
       });
     });
   }
@@ -460,12 +639,20 @@
       });
       // 표의 빈칸:  [성명][   ]  또는  위 칸 제목 / 아래 빈칸
       els(doc, 'tbl').forEach(tbl => {
-        const rows = tableGrid(tbl);
-        const texts = rows.map(cells => cells.map(cellText));
-        if (isListTable(rows, texts)) {                       // 명단형 표
-          lists.push({ headers: texts[0], rows: texts.slice(1), tcs: rows.slice(1) });
+        const g = gridOf(tbl);
+        if (isListGrid(g)) {                                  // 명단형 표 (합친 칸 포함)
+          const body = g.slice(1);
+          lists.push({
+            headers: g[0].map(x => x.text),
+            rows: body.map(row => row.map(x => x.text)),
+            skip: body.map(row => row.map(x => !x.own)),       // 위·옆 칸과 합쳐진 자리
+            tall: body.map(row => row.map(x => x.tall)),       // 여러 줄을 합친 칸
+            tcs: body.map(row => row.map(x => (x.own ? x.tc : null)))
+          });
           return;
         }
+        const rows = tableGrid(tbl);
+        const texts = rows.map(cells => cells.map(cellText));
         rows.forEach((cells, r) => {
           const used = new Set();
           for (let i = 0; i < cells.length - 1; i++) {
@@ -485,12 +672,12 @@
     }
     return {
       fields: fl.list(),
-      lists: lists.map(l => ({ headers: l.headers, rows: l.rows })),
+      lists: lists.map(l => ({ headers: l.headers, rows: l.rows, skip: l.skip, tall: l.tall })),
       async build(values, listFills) {
         markerParas.forEach(p => fillMarkerPara(p, values, ext));
         lists.forEach((l, li) => l.tcs.forEach((cells, ri) => cells.forEach((tc, ci) => {
           const v = listFills && listFills[li] && listFills[li][ri] && listFills[li][ri][ci];
-          if (v && cellText(tc) === '') writeIntoCell(tc, String(v), ext);
+          if (v && tc && cellText(tc) === '') writeIntoCell(tc, String(v), ext);
         })));
         blanks.forEach(b => { const v = values[b.key]; if (v) writeIntoCell(b.tc, String(v), ext); });
         Object.keys(docs).forEach(path => zip.file(path, serXml(docs[path])));
@@ -789,7 +976,7 @@
     <div id="msg" class="info">① 자료와 ② 양식을 넣어 주세요.</div>
     <div id="tableBox" class="hidden">
       <p style="font-size:15px;color:#4b5563;margin:6px 0 12px">
-        초록 칸은 자료에서 찾은 내용, 노란 칸은 못 찾은 내용입니다. 칸을 눌러 직접 고칠 수 있어요.
+        초록 칸은 자료에서 찾은 내용, 노란 칸은 못 찾은 내용, 회색 칸은 자료에서도 비어 있어 빈칸으로 남는 곳입니다. 칸을 눌러 직접 고칠 수 있어요.
       </p>
       <div id="listBox"></div>
       <table id="singleBox">
@@ -978,13 +1165,17 @@ function drawLists() {
       const m = listMatch[li][ri];
       cells.forEach((v, ci) => {
         const td = document.createElement('td');
-        if (v) { td.textContent = v; td.className = 'fixed'; }
+        if (l.skip && l.skip[ri][ci]) { td.textContent = v ? '〃' : ''; td.className = 'fixed'; }
+        else if (v) { td.textContent = v; td.className = 'fixed'; }
         else {
           const inp = document.createElement('input');
           inp.value = m.values[ci] || '';
-          inp.className = inp.value ? 'found' : 'empty';
+          // 사람(줄)은 찾았는데 자료에서도 빈 칸이면 → 양식에도 빈 칸으로 둠 (회색)
+          const blankKind = m.from ? 'blank' : 'empty';
+          if (m.from && !inp.value) inp.placeholder = '(자료도 빈칸)';
+          inp.className = inp.value ? 'found' : blankKind;
           inp.dataset.li = li; inp.dataset.ri = ri; inp.dataset.ci = ci;
-          inp.oninput = () => { inp.className = inp.value ? 'found' : 'empty'; };
+          inp.oninput = () => { inp.className = inp.value ? 'found' : blankKind; };
           td.appendChild(inp);
         }
         tr.appendChild(td);
