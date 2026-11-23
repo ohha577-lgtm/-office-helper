@@ -436,7 +436,9 @@
       });
       pdfLines(loose).forEach(l => rows.push(l.cells.map(c => c.s.trim()).filter(Boolean)));
     }
-    return { rows, lists };
+    let text = [];
+    try { text = await pdfTextLines(pdf); } catch (e) { text = []; }
+    return { rows, lists, text };
   }
 
   /* 엑셀 서식 읽기 — 한컴 셀 파일처럼 서식을 <AlternateContent>로 감싼 경우도 바르게 */
@@ -554,7 +556,10 @@
       }
       return { name, rows, lists };
     }
-    if (ext === 'pdf') { const r = await pdfRows(buf, name); return { name, rows: r.rows, lists: r.lists }; }
+    if (ext === 'pdf') {
+      const r = await pdfRows(buf, name);
+      return { name, rows: r.rows, lists: r.lists, ins: insFromText(r.text, name) };
+    }
     if (ext === 'txt') {
       const txt = new TextDecoder('utf-8').decode(buf);
       return { name, rows: txt.split(/\r?\n/).map(s => s.trim()).filter(Boolean).map(s => [s]) };
@@ -607,6 +612,7 @@
     const dataLists = [];
     datas.forEach(d => (d.lists || []).forEach(l => dataLists.push(l)));
     return formLists.map(fl => {
+      if (fl.ins) return matchIns(fl, datas);
       const hs = fl.headers.map(headKey);
       const overlap = l => hs.filter(h => l.headers.includes(h)).length;
       const cands = dataLists.filter(l => overlap(l) >= Math.max(1, Math.ceil(hs.length / 2)))
@@ -649,6 +655,160 @@
         if (rec) used.add(rec);
         return { from, values: cells.map((v, i) => (v || skip[i]) ? null : (rec && rec[hs[i]] != null ? String(rec[hs[i]]) : '')) };
       });
+    });
+  }
+
+  /* =================================================================
+     2-1. 4대보험 기관부담금 신청 양식 전용
+          (같은 '건강보험'이 개인부담금·기관부담금에 두 번 나오는 양식)
+     ================================================================= */
+  const INS_KINDS = [
+    ['health', /^(건강보험|건강보험료|건강)$/],
+    ['ltc', /^(노인)?장기요양(보험)?(료)?$/],
+    ['pension', /^(국민)?연금(보험)?(료)?$/],
+    ['employ', /^고용보험(료)?$/],
+    ['accident', /^산재보험(료)?$/]
+  ];
+  const KIND_NAME = { health: '건강보험', ltc: '장기요양보험', pension: '국민연금', employ: '고용보험', accident: '산재보험' };
+  function insKind(s) { const k = norm(s); for (const [n, re] of INS_KINDS) if (re.test(k)) return n; return null; }
+  function insGroup(s) {
+    const k = norm(s);
+    if (/개인|근로자/.test(k)) return 'p';      // 개인부담금
+    if (/기관|사용자|사업주/.test(k)) return 'e'; // 기관부담금
+    return null;
+  }
+  const toNum = s => +String(s).replace(/,/g, '');
+  const lastNum = l => { const a = String(l).match(/-?[\d,]*\d/g); return a ? toNum(a[a.length - 1]) : null; };
+
+  /* PDF 글자를 사람이 보는 방향 그대로 줄 단위 글로 바꾸기 (가로로 돌린 쪽도 바르게) */
+  async function pdfTextLines(pdf) {
+    const lib = root.pdfjsLib, out = [];
+    for (let i = 1; i <= pdf.numPages; i++) {
+      const page = await pdf.getPage(i);
+      const vp = page.getViewport({ scale: 1 });
+      const tc = await page.getTextContent();
+      const items = [];
+      tc.items.forEach(it => {
+        if (!it.str || !it.str.trim()) return;
+        const m = lib.Util.transform(vp.transform, it.transform);
+        items.push({ x: m[4], y: -m[5], w: it.width, s: it.str, h: Math.hypot(m[2], m[3]) || 10 });
+      });
+      const ls = [];
+      items.forEach(it => {
+        let l = ls.find(l => Math.abs(l.y - it.y) < it.h * 0.5);
+        if (!l) { l = { y: it.y, a: [] }; ls.push(l); }
+        l.a.push(it);
+      });
+      ls.sort((a, b) => b.y - a.y).forEach(l => {
+        l.a.sort((a, b) => a.x - b.x);
+        let s = '', prev = null;
+        l.a.forEach(it => { if (prev) s += it.x - (prev.x + prev.w) > it.h * 0.25 ? ' ' : ''; s += it.s; prev = it; });
+        out.push(s.trim());
+      });
+    }
+    return out;
+  }
+
+  /* 자료 PDF에서 사람마다 보험료 뽑기
+     결과: { 이름: { 'p.health': {v, from, pr}, 'e.pension': … } }   p=개인, e=기관, pr=우선순위(작을수록 먼저) */
+  function insFromText(lines, src) {
+    const all = lines.join('\n'), out = {};
+    const put = (person, g, k, v, pr) => {
+      if (!person || v == null || isNaN(v)) return;
+      const o = out[norm(person)] = out[norm(person)] || {};
+      const key = g + '.' + k;
+      if (!o[key] || pr < o[key].pr) o[key] = { v, from: src, pr };
+    };
+    const NM = '([가-힣]{2,5})';
+    // (1) 급여대장: "1.김도희 107,890 14,170 140,600 27,010 …" (개인부담금 = 실제로 뗀 금액)
+    if (/급여대장/.test(all)) {
+      let order = ['health', 'ltc', 'pension', 'employ'];
+      const head = lines.find(l => /^성명\s/.test(l) && /건강/.test(l));
+      if (head) {
+        const ks = [];
+        for (const w of head.split(/\s+/).slice(1)) { const k = insKind(w); if (!k) break; ks.push(k); }
+        if (ks.length >= 2) order = ks;
+      }
+      const re = new RegExp('^\\d+\\.\\s*' + NM + '\\s+((?:[\\d,]+\\s*)+)');
+      lines.forEach(l => {
+        const m = re.exec(l);
+        if (!m) return;
+        const ns = m[2].trim().split(/\s+/).map(toNum);
+        order.forEach((k, i) => { if (k && ns[i] != null) put(m[1], 'p', k, ns[i], 1); });
+      });
+    }
+    // (2) 국민연금 결정내역: "1 강주영 720324-2****** 283,100 141,550 141,550"
+    if (/연금/.test(all) && /사용자부담금/.test(all)) {
+      const re = new RegExp('^\\d+\\s+' + NM + '\\s+\\d{6}-\\S+\\s+([\\d,]+)\\s+([\\d,]+)\\s+([\\d,]+)');
+      lines.forEach(l => {
+        const m = re.exec(l);
+        if (m) { put(m[1], 'p', 'pension', toNum(m[3]), 2); put(m[1], 'e', 'pension', toNum(m[4]), 1); }
+      });
+    }
+    const personLine = new RegExp('^\\d+\\s+\\S+\\s+' + NM + '\\s+\\d{2}-\\d{2}-\\d{2}');
+    // (3) 고용보험 근로자 내역: 한 사람이 4줄 (근로자실업급여 / 사업주실업급여 / 사업주고안직능 / 개인별소계)
+    if (/고용\)?\s*근로자/.test(all) || /실업급여보험료/.test(all)) {
+      let cur = {};
+      lines.forEach(l => {
+        const t = l.replace(/\s/g, '');
+        if (/^근로자실업급여/.test(t)) cur.pu = lastNum(l);
+        else if (/^사업주실업급여/.test(t)) cur.eu = lastNum(l);
+        else if (/^사업주고안직능/.test(t)) cur.ej = lastNum(l);
+        else if (/^개인별소계/.test(t)) {
+          if (cur.name) {
+            if (cur.pu != null) put(cur.name, 'p', 'employ', cur.pu, 2);
+            if (cur.eu != null || cur.ej != null) put(cur.name, 'e', 'employ', (cur.eu || 0) + (cur.ej || 0), 1);
+          }
+          cur = {};
+        } else { const m = personLine.exec(l); if (m) cur.name = m[1]; }
+      });
+    }
+    // (4) 산재보험 근로자 내역: "1 일반 강주영 72-03-24 … 23,750" (맨 끝 = 보험료합계)
+    if (/산재\)?\s*근로자/.test(all)) {
+      lines.forEach(l => { const m = personLine.exec(l); if (m) put(m[1], 'e', 'accident', lastNum(l), 1); });
+    }
+    // (5) 건강보험 고지내역: 줄에 이름과 금액이 있고, 제목 줄에 건강·요양·(근로자/사용자) 순서가 있는 경우
+    const hHead = lines.findIndex(l => /성명/.test(l) && /건강/.test(l) && /요양/.test(l) && !/급여대장/.test(all));
+    if (hHead >= 0) {
+      const cols = [];
+      let g = null;
+      lines[hHead].split(/\s+/).forEach(w => {
+        const gg = insGroup(w); if (gg) g = gg;
+        const k = insKind(w.replace(/(가입자|근로자|사용자|사업주|기관|개인|부담금?|분)/g, ''));
+        if (k === 'health' || k === 'ltc') cols.push({ g: insGroup(w) || g, k });
+      });
+      if (cols.length && cols.every(c => c.g)) {
+        const re = new RegExp('^(?:\\d+\\s+)?' + NM + '\\s+(?:\\S*\\d{6}\\S*\\s+)?((?:[\\d,]+\\s*)+)$');
+        lines.slice(hHead + 1).forEach(l => {
+          const m = re.exec(l); if (!m) return;
+          const ns = m[2].trim().split(/\s+/).map(toNum);
+          const tail = ns.slice(-cols.length);
+          if (tail.length === cols.length) cols.forEach((c, i) => put(m[1], c.g, c.k, tail[i], c.g === 'p' ? 2 : 1));
+        });
+      }
+    }
+    return out;
+  }
+
+  /* 4대보험 양식 줄마다 같은 사람의 값 채우기 */
+  function matchIns(fl, datas) {
+    const pool = {};
+    datas.forEach(d => Object.entries(d.ins || {}).forEach(([n, o]) => {
+      const p = pool[n] = pool[n] || {};
+      Object.entries(o).forEach(([k, x]) => { if (!p[k] || x.pr < p[k].pr) p[k] = x; });
+    }));
+    return fl.rows.map((cells, ri) => {
+      const rec = pool[norm(cells[fl.ins.nameIdx])];
+      const used = new Set();
+      const values = cells.map((v, i) => {
+        if (v || (fl.skip && fl.skip[ri] && fl.skip[ri][i])) return null;
+        const c = fl.ins.cols.find(c => c.i === i);
+        const x = c && rec && rec[c.g + '.' + c.k];
+        if (!x) return '';
+        used.add(x.from);
+        return String(x.v);
+      });
+      return { from: Array.from(used).join(', '), values };
     });
   }
 
@@ -894,6 +1054,41 @@
       const txt = (r, c) => { const x = cells.get(r + ',' + c); return x && !hidden(r, c) ? cellStr(x.el) : ''; };
       const rowNums = Array.from(new Set(sorted.map(x => x.row))).sort((a, b) => a - b);
       let listEnd = 0;
+      // ★ 4대보험 양식: '건강보험·국민연금…' 줄 + 그 위 줄의 '개인부담금 / 기관부담금'
+      for (const r of rowNums) {
+        const maxC = Math.max(...sorted.filter(x => x.row === r).map(x => x.col));
+        const kindCols = [];
+        for (let c = 1; c <= maxC; c++) { const k = insKind(txt(r, c)); if (k) kindCols.push({ c, k }); }
+        if (kindCols.length < 3) continue;
+        const findCol = re => { for (const rr of [r, r - 1, r - 2]) for (let c = 1; c <= maxC; c++) if (rr > 0 && re.test(norm(txt(rr, c)))) return c; return 0; };
+        const nameCol = findCol(/^(성명|이름|근로자명)$/);
+        if (!nameCol) continue;
+        const groupOf = c => {                     // 위 줄에서 왼쪽으로 가며 '개인/기관' 찾기
+          for (const rr of [r - 1, r - 2]) {
+            if (rr < 1) continue;
+            for (let cc = c; cc >= 1; cc--) { const s = txt(rr, cc); if (s) { const g = insGroup(s); if (g) return g; break; } }
+          }
+          return null;
+        };
+        const cols = kindCols.map(o => Object.assign(o, { g: groupOf(o.c) })).filter(o => o.g);
+        if (cols.length < 3) continue;
+        const jobCol = findCol(/^(직종|직위|직급)$/);
+        const body = [];
+        for (let rr = r + 1; txt(rr, nameCol); rr++) body.push(rr);
+        if (!body.length) continue;
+        const show = [nameCol].concat(jobCol ? [jobCol] : [], cols.map(o => o.c));
+        lists.push({
+          doc,
+          headers: ['성명'].concat(jobCol ? ['직종'] : [], cols.map(o => (o.g === 'p' ? '개인 ' : '기관 ') + KIND_NAME[o.k])),
+          rows: body.map(rr => show.map(c => { const x = cells.get(rr + ',' + c); return x && !hidden(rr, c) ? showCell(x.el) : ''; })),
+          skip: body.map(rr => show.map(c => { const x = cells.get(rr + ',' + c); return !!hidden(rr, c) || !!(x && kids(x.el, 'f').length); })),
+          pos: body.map(rr => show.map(c => ({ row: rr, col: c }))),
+          ins: { nameIdx: 0, cols: cols.map((o, i) => ({ i: i + 1 + (jobCol ? 1 : 0), g: o.g, k: o.k })) }
+        });
+        body.concat([r]).forEach(rr => show.forEach(c => inList.add(rr + ',' + c)));
+        listEnd = Infinity;                          // 이 시트는 4대보험 양식으로만 처리
+        break;
+      }
       for (const r of rowNums) {
         if (r <= listEnd) continue;
         const full = sorted.filter(x => x.row === r && !hidden(r, x.col) && cellStr(x.el) !== '');
@@ -989,7 +1184,7 @@
 
     return {
       fields: fl.list(),
-      lists: lists.map(l => ({ headers: l.headers, rows: l.rows, skip: l.skip })),
+      lists: lists.map(l => ({ headers: l.headers, rows: l.rows, skip: l.skip, ins: l.ins })),
       async build(values, listFills) {
         markerItems.forEach(node => fillMarkerPara(node, values, 'xlsx'));
         blanks.forEach(b => { const v = values[b.key]; if (v) putValue(b.el, v); });
@@ -1380,8 +1575,8 @@ function drawLists() {
           const inp = document.createElement('input');
           inp.value = m.values[ci] || '';
           // 사람(줄)은 찾았는데 자료에서도 빈 칸이면 → 양식에도 빈 칸으로 둠 (회색)
-          const blankKind = m.from ? 'blank' : 'empty';
-          if (m.from && !inp.value) inp.placeholder = '(자료도 빈칸)';
+          const blankKind = m.from && !l.ins ? 'blank' : 'empty';
+          if (m.from && !l.ins && !inp.value) inp.placeholder = '(자료도 빈칸)';
           inp.className = inp.value ? 'found' : blankKind;
           inp.dataset.li = li; inp.dataset.ri = ri; inp.dataset.ci = ci;
           inp.oninput = () => { inp.className = inp.value ? 'found' : blankKind; };
